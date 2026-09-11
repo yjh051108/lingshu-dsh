@@ -46,6 +46,94 @@ def _cs_from_dict(d):
 class DexHandler(BaseHTTPRequestHandler):
     cloud = None  # ConditionDex 实例（由 run_server 注入）
 
+    # ---- DSH 侧扩展（engram 融合用；上游 0.5.0 无此三处，同步时按此处回植）----
+    # 学习统计（模块级：收敛观测仪表盘）
+    _LEARN_STATS = {"respond": 0, "strong": 0, "weak": 0, "miss": 0,
+                    "clusters": 0, "cards": 0}
+    # 自动补词网状态（服务进程内持续统计）
+    _WEAK_HITS = {}  # 查询→{count, top_card, last_at}
+
+    def _auto_cluster(self, condition, results):
+        """弱命中统计与自动建簇（零 LLM）：同一查询多次弱命中（top<0.5）→
+        从查询提取俗语词，建簇映射到已命中卡（规范词=卡名）→
+        写 clusters_ext.json + 动态更新翻译表。"""
+        import time as _t
+        q = (condition or "").strip()
+        if len(q) < 4 or not results:
+            return None
+        top = results[0] if results else {}
+        top_score = top.get("score") or top.get("algo_score") or 0
+        top_algo = top.get("algo_score") or 0
+        top_name = top.get("name")
+        if not top_name or float(top_score) >= 0.5:
+            return None  # 强命中无需补
+        # 相关性门槛：algo_score（词面关联）低于噪声线 → top 卡是重叠噪声，不建簇
+        if float(top_algo) < 0.05:
+            return None
+        key = q[:30]
+        rec = self._WEAK_HITS.get(key)
+        if rec is None:
+            self._WEAK_HITS[key] = {"count": 1, "top_card": top_name, "last_at": _t.time()}
+            return None
+        rec["count"] += 1
+        rec["last_at"] = _t.time()
+        if rec["count"] < 3:
+            return None
+        # 触发建簇：提取查询词（≥2 字/ASCII≥3），排除已在翻译表的
+        import semantic_translate as _st
+        import json as _json, os as _os
+        existing = set()
+        for _cls in (_st.SYNONYM_CLUSTERS.values(), _st.DOMAIN_SYNONYM_CLUSTERS.values()):
+            for _words in _cls:
+                existing.update(_words)
+        import re as _re
+        words = set()
+        for m in _re.finditer(r"[a-z][a-z0-9_]{2,}", q.lower()):
+            words.add(m.group())
+        for m in _re.finditer(r"[\u4e00-\u9fff]{2,}", q):
+            s = m.group()
+            if len(s) == 2:
+                words.add(s)
+            elif len(s) == 3:
+                words.add(s[:2]); words.add(s[1:3])
+            else:
+                # 首+中+尾 2-gram（中间片段承载核心语义）
+                _mid = (len(s) - 1) // 2
+                words.add(s[:2]); words.add(s[_mid:_mid + 2]); words.add(s[-2:])
+        _QW = set("怎么 什么 如何 为啥 为什么 哪些 哪个 多少 哪里 何时 是否 有没有 能不能 会不会 怎么样 怎样 这样 那样 一个 一种 一下 起来 以后 内容 东西".split())
+        # 已覆盖词：翻译表 + 目标卡 trigger（从卡库查——避免建无用簇）
+        from aeis_core import MemoryLayer as _ML
+        _top_trig = set()
+        try:
+            for _n in self.cloud.store.query_nodes(layer=_ML.KNOWLEDGE, limit=2000):
+                _sa = _n.state_attributes or {}
+                if _sa.get("name") == top_name:
+                    _top_trig = set(t.strip() for t in str((_sa.get("response") or {}).get("trigger") or "").split(",") if t.strip())
+                    break
+        except Exception:
+            pass
+        new_words = [w for w in words if w not in existing and w not in _top_trig and w not in top_name and w not in _QW]
+        if not new_words:
+            rec["count"] = 0  # 无新词可补，重置计数
+            return None
+        # 建簇：规范词=已命中卡名
+        ext_path = _os.path.join(_os.path.dirname(_os.path.abspath(_st.__file__)), "clusters_ext.json")
+        try:
+            with open(ext_path, encoding="utf-8") as _f:
+                ext = _json.load(_f)
+        except Exception:
+            ext = {}
+        if top_name not in ext:
+            ext[top_name] = []
+        merged = list(dict.fromkeys(ext[top_name] + new_words))
+        ext[top_name] = merged
+        with open(ext_path, "w", encoding="utf-8") as _f:
+            _json.dump(ext, _f, ensure_ascii=False, indent=1)
+        # 动态更新翻译表（本进程立即生效）
+        _st.DOMAIN_SYNONYM_CLUSTERS[top_name] = merged
+        rec["count"] = 0
+        return {"added": top_name, "words": new_words}
+
     def log_message(self, *args):
         """静默访问日志：默认逐请求刷屏，覆写为空。"""
         pass
@@ -160,15 +248,144 @@ class DexHandler(BaseHTTPRequestHandler):
         try:
             if op == "filter":
                 return {"op": op, "results": d.dex_filter(**params)}
+            if op == "learn_stats":
+                # DSH 侧：补卡/收敛观测仪表盘（engram 融合）
+                return {"op": op, "results": dict(self._LEARN_STATS)}
+            if op == "add_card":
+                # DSH 侧：自动补卡端点（relay 缺口闭环调用）——add_entry 写入知识卡
+                name = params.get("name", "")
+                if not name:
+                    return {"op": op, "ok": False, "error": "name required"}
+                if str(params.get("source", "")) == "auto-gap":
+                    self._LEARN_STATS["cards"] += 1
+                # 同名查重（加载既有库时 _by_name 为空 → 卡库级扫描，重复卡真实防写入）
+                try:
+                    from aeis_core import MemoryLayer as _ML2
+                    _dup = [n for n in d.store.query_nodes(layer=_ML2.KNOWLEDGE, limit=2000)
+                            if (n.state_attributes or {}).get("name") == name]
+                    if _dup:
+                        return {"op": op, "ok": True, "existed": True, "name": name}
+                except Exception:
+                    pass
+                from aeis_core import ConditionSpace
+                cs = ConditionSpace(
+                    observation_position=params.get("obs_pos", "自动补卡"),
+                    observation_tool="识别卡",
+                    time_window=(0.0, 1e10),
+                    existence_constraint=params.get("cons", "通用"))
+                d.add_entry(
+                    name=name,
+                    domain=params.get("domain", "通用"),
+                    claim=params.get("claim", ""),
+                    cs=cs,
+                    level=int(params.get("level", 2)),
+                    status=params.get("status", "verified"),
+                    response={
+                        "trigger": params.get("trigger", ""),
+                        "action": params.get("action", ""),
+                        "counters": params.get("counters", ""),
+                    },
+                    tags=[f"domain:{params.get('domain', '通用')}"],
+                    card2={"source": params.get("source", "auto")})
+                return {"op": op, "ok": True, "existed": False, "name": name}
             if op == "respond":
                 # 知识翻译体系全链路（四路融合：语义指纹+学科路由+二元组+神经索引）
+                # + DSH 侧增强：algo 三通道重排（零 LLM）+ 弱命中自动补词网 + 学习统计
                 try:
                     import semantic_translate as _st
-                    results = _st.graph_retrieve(d, params.get("condition", ""), limit=8)
-                    return {"op": op, "results": results}
                 except Exception:
-                    return {"op": op, "results": d.dex_respond(
-                        params.get("condition", ""))}
+                    _st = None
+                try:
+                    results = _st.graph_retrieve(d, params.get("condition", ""), limit=8)
+                except Exception:
+                    results = d.dex_respond(params.get("condition", ""), translator=_st)
+                if str(params.get("algo", "1")) not in ("0", "false", "False"):
+                    try:
+                        from semantic_algo import algo_rerank
+                        results = algo_rerank(d, params.get("condition", ""), results)
+                    except Exception:
+                        pass
+                # DSH 侧字段规整：新翻译层会返「口语直答」条目（id=null · _from_daily ·
+                # 只有 daily 文本、无 level/status/action）——engram 侧按
+                # L{level}/{status}：{action} 渲染出招，不补则出招文本为空、信息被丢。
+                for _h in (results or []):
+                    if not _h.get("action"):
+                        _h["action"] = _h.get("daily") or _h.get("direct_answer") or ""
+                    if not _h.get("status"):
+                        _h["status"] = "verified" if _h.get("id") else "daily"
+                # 保底卡锚：整批都没有卡背书（全是口语直答）时，追卡库出招——
+                # 保证「直答 + 可溯源卡」两全（engram 融合：知道出处才敢用）。
+                # 选取即按「具体出招卡优先、模板学科卡兜底」排序：否则种子卡会把
+                # 具体识别卡挤出名额（实测：生锈题只有 2 个名额，全被学科卡占）。
+                if results and not any(x.get("id") for x in results):
+                    try:
+                        _extra = d.dex_respond(params.get("condition", ""), translator=_st) or []
+                        _have = {x.get("name") for x in results}
+
+                        def _rank(e):
+                            _a = (e.get("action") or "").strip()
+                            return (0 if (_a and not _a.endswith("知识点回应")) else 1,
+                                    -(e.get("score") or 0))
+
+                        for _e in sorted([x for x in _extra if x.get("name") not in _have],
+                                         key=_rank)[:3]:
+                            results.append(_e)
+                    except Exception:
+                        pass
+                cluster_hint = None
+                try:
+                    cluster_hint = self._auto_cluster(params.get("condition", ""), results)
+                except Exception:
+                    cluster_hint = None
+                try:
+                    self._LEARN_STATS["respond"] += 1
+                    top_s = results[0].get("score") if results else 0
+                    if top_s >= 0.5:
+                        self._LEARN_STATS["strong"] += 1
+                    elif top_s >= 0.1:
+                        self._LEARN_STATS["weak"] += 1
+                    else:
+                        self._LEARN_STATS["miss"] += 1
+                    if cluster_hint:
+                        self._LEARN_STATS["clusters"] += 1
+                    # 学习趋势持久化（每 20 次响应快照——跨重启长期观测）
+                    if self._LEARN_STATS["respond"] % 20 == 0:
+                        try:
+                            import datetime as _dt
+                            _logdir = os.path.join(HERE, "audit_log")
+                            os.makedirs(_logdir, exist_ok=True)
+                            with open(os.path.join(_logdir, "learn_stats.log"), "a", encoding="utf-8") as _f:
+                                _f.write(_dt.datetime.now().isoformat(timespec="seconds") + " " +
+                                         json.dumps(self._LEARN_STATS, ensure_ascii=False) + "\n")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # DSH 侧排序（落库学科卡后加的护栏）：上游种子卡的 response.action 是
+                # 模板句「以X知识点回应」——它是知识容器、不是出招，触发词又长，容易在
+                # 通用词上与具体识别卡同分甚至更高，把可执行出招挤出 top3（实测：生锈题
+                # 被「初中化学 6.40」顶掉「化学_氧化还原」）。规则：模板卡降权 0.5（保留
+                # 相对次序 → 学科题如「量子力学是什么」仍能命中该卡），口语直答恒排首位。
+                for _h in (results or []):
+                    _a = (_h.get("action") or "").strip()
+                    if _a.endswith("知识点回应"):
+                        _h["templated"] = True
+                        _h["score"] = round((_h.get("score") or 0) * 0.5, 4)
+                try:
+                    results.sort(key=lambda x: (0 if x.get("status") == "daily" else 1,
+                                                -(x.get("score") or 0)))
+                except Exception:
+                    pass
+                # 尊重调用方 limit（上游此处硬编码 8，无视 params.limit；落库后 8 条里
+                # 后段多为同族学科卡，对「出招」是噪声）：默认仍 8，显式传则照传。
+                try:
+                    _lim = int(params.get("limit", 8) or 8)
+                    if _lim > 0:
+                        results = results[:_lim]
+                except Exception:
+                    pass
+                return {"op": op, "results": results, "cluster": cluster_hint,
+                        "learn": dict(self._LEARN_STATS)}
             if op == "status_node":
                 return {"op": op, "results": d.dex_status(params.get("node_id", ""))}
             if op == "cs":
@@ -401,8 +618,10 @@ def _parse_card_md(path):
 def _seed_cards(dex):
     """从本地打包的卡源重建知识卡（首启种子，离线可用）。返回新增数。"""
     from aeis_core import MemoryLayer, ConditionSpace
+    # DSH 侧修正：查重窗口 500 → 5000。本仓现役库已有近千节点，500 窗口外的既有卡名
+    # 查不到 → 会把同名卡再建一遍（重复卡污染 respond/verify 候选）。窗口必须盖住全库。
     existing = {n.state_attributes.get("name")
-                for n in dex.store.query_nodes(layer=MemoryLayer.KNOWLEDGE, limit=500)
+                for n in dex.store.query_nodes(layer=MemoryLayer.KNOWLEDGE, limit=5000)
                 if n.state_attributes.get("name")}
     added = 0
     if not os.path.isdir(SEED_CARDS_DIR):
